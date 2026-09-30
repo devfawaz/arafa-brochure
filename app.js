@@ -9,7 +9,7 @@ const canvas = document.getElementById('gl');
 const stage = document.getElementById('stage');
 const loading = document.getElementById('loading');
 const nextBtn = document.getElementById('nextBtn'), nextLabel = document.getElementById('nextLabel'), prevBtn = document.getElementById('prevBtn');
-const dots = [...document.querySelectorAll('.steps i')], status = document.getElementById('status');
+const status = document.getElementById('status');
 const flipBtn = document.getElementById('flipBtn'), resetBtn = document.getElementById('resetBtn');
 const hint = document.getElementById('hint');
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -69,10 +69,12 @@ for (const lang of ['en', 'ar']) for (const k of keys) {
 
 // A panel is a thin box: printed front and back, plain paper edges.
 const edge = new THREE.MeshStandardMaterial({ color: 0xf1ebdf, roughness: .9 });
-function panel(frontKey, backKey) {
+// Edges that meet at a crease are navy, like the print on the outside of each fold, so no paper line shows there.
+const creaseEdge = new THREE.MeshStandardMaterial({ color: 0x141b38, roughness: .8 });
+function panel(frontKey, backKey, { plusX = edge, minusX = edge } = {}) {
   const front = new THREE.MeshStandardMaterial({ roughness: .78, metalness: 0 });
   const back = new THREE.MeshStandardMaterial({ roughness: .78, metalness: 0 });
-  const m = new THREE.Mesh(new THREE.BoxGeometry(W, H, T), [edge, edge, edge, edge, front, back]);
+  const m = new THREE.Mesh(new THREE.BoxGeometry(W, H, T), [plusX, minusX, edge, edge, front, back]);
   m.castShadow = true; m.receiveShadow = true;
   m.userData = { front, back, frontKey, backKey };
   return m;
@@ -85,36 +87,66 @@ const holder = new THREE.Group();          // sits on the floor
 holder.add(brochure);
 scene.add(holder);
 
-const mid = panel('in-1', 'out-1');
+const mid = panel('in-1', 'out-1', { plusX: creaseEdge, minusX: creaseEdge });
 brochure.add(mid);
 // Hinges sit on the printed front surface, so the printed faces meet exactly along each crease when open.
 // Right flap folds in first; the cover panel folds over it, lifted by a paper thickness only as it folds.
 const rightHinge = new THREE.Group(); rightHinge.position.set(W / 2, 0, T / 2);
-const right = panel('in-2', 'out-0'); right.position.set(W / 2, 0, -T / 2);
+const right = panel('in-2', 'out-0', { minusX: creaseEdge }); right.position.set(W / 2, 0, -T / 2);
 rightHinge.add(right); brochure.add(rightHinge);
 const leftHinge = new THREE.Group(); leftHinge.position.set(-W / 2, 0, T / 2);
-const left = panel('in-0', 'out-2'); left.position.set(-W / 2, 0, -T / 2);
+const left = panel('in-0', 'out-2', { plusX: creaseEdge }); left.position.set(-W / 2, 0, -T / 2);
 leftHinge.add(left); brochure.add(leftHinge);
-// A paper spine along each crease fills the hairline wedge on the outside of the fold.
+// A spine along each crease fills the hairline wedge on the outside of the fold. It's navy, the colour
+// printed on both sides of each outside crease, and sits just behind the inside surface so it never shows there.
+const spineMat = creaseEdge;
 for (const x of [-W / 2, W / 2]) {
-  const spine = new THREE.Mesh(new THREE.CylinderGeometry(T / 2, T / 2, H, 12), edge);
-  spine.position.set(x, 0, 0); spine.castShadow = true; brochure.add(spine);
+  const spine = new THREE.Mesh(new THREE.CylinderGeometry(T * .46, T * .46, H * .999, 12), spineMat);
+  spine.position.set(x, 0, -T * .06); brochure.add(spine);
 }
 const panels = [mid, right, left];
 
-// Pages, opened one at a time: 0 closed (cover), 1 cover opened, 2 fully open (inside spread).
-const STEPS = [
-  { left: Math.PI - 0.002, right: -Math.PI + 0.002, spread: 0, next: 'Open', say: 'Closed, front cover' },
-  { left: OPEN_ANGLE, right: -Math.PI + 0.002, spread: .5, next: 'Next page', say: 'Cover opened' },
-  { left: OPEN_ANGLE, right: -OPEN_ANGLE, spread: 1, next: 'Close', say: 'Fully open, inside spread' },
-];
-const state = { step: 0, flipped: false, lang: 'en' };
+// Folds: closed, cover opened, fully open.
+const FOLD = {
+  closed: { left: Math.PI - 0.002, right: -Math.PI + 0.002, spread: 0 },
+  cover: { left: OPEN_ANGLE, right: -Math.PI + 0.002, spread: .5 },
+  open: { left: OPEN_ANGLE, right: -OPEN_ANGLE, spread: 1 },
+};
+// Where each page sits once open, and the angle that faces it square on.
+const cosA = Math.cos(OPEN_ANGLE), sinA = Math.sin(OPEN_ANGLE), deg = THREE.MathUtils.degToRad;
+const PAGE = {
+  cover: { x: 0, z: T, az: deg(-16) },
+  flap: { x: 0, z: T * 2, az: deg(-8) },
+  left: { x: -W / 2 - W / 2 * cosA, z: W / 2 * sinA, az: OPEN_ANGLE + deg(2) },
+  mid: { x: 0, z: 0, az: deg(0) },
+  right: { x: W / 2 + W / 2 * cosA, z: W / 2 * sinA, az: -OPEN_ANGLE - deg(2) },
+  back: { x: 0, z: 0, az: deg(16) },
+};
+// Reading order, one page per step. Arabic reads the inside right to left.
+function steps(lang) {
+  const inside = lang === 'ar' ? ['right', 'mid', 'left'] : ['left', 'mid', 'right'];
+  return [
+    { fold: 'closed', flip: false, page: 'cover', next: 'Open', say: 'Front cover' },
+    { fold: 'cover', flip: false, page: 'flap', next: 'Next page', say: 'Welcome flap' },
+    { fold: 'open', flip: false, page: inside[0], next: 'Next page', say: 'Inside, page 1 of 3' },
+    { fold: 'open', flip: false, page: inside[1], next: 'Next page', say: 'Inside, page 2 of 3' },
+    { fold: 'open', flip: false, page: inside[2], next: 'Close', say: 'Inside, page 3 of 3' },
+    { fold: 'closed', flip: true, page: 'back', next: 'Start again', say: 'Back cover' },
+  ];
+}
+let STEPS = steps('en');
+const dotsWrap = document.querySelector('.steps');
+dotsWrap.innerHTML = STEPS.map(() => '<i></i>').join('');
+const dotEls = [...dotsWrap.children];
+
+const state = { step: 0, flipped: false, lang: 'en', fold: 'closed' };
 const anim = {
-  left: { v: STEPS[0].left, to: STEPS[0].left, delay: 0 },
-  right: { v: STEPS[0].right, to: STEPS[0].right, delay: 0 },
+  left: { v: FOLD.closed.left, to: FOLD.closed.left, delay: 0 },
+  right: { v: FOLD.closed.right, to: FOLD.closed.right, delay: 0 },
   turn: { v: 0, to: 0, delay: 0 },
   spread: { v: 0, to: 0, delay: 0 },
 };
+const tween = (a, to, delay, now) => { a.from = a.v; a.to = to; a.delay = delay; a.start = now; };
 
 function applyTextures() {
   for (const p of panels) {
@@ -124,73 +156,91 @@ function applyTextures() {
   }
 }
 
-function go(step) {
-  step = Math.max(0, Math.min(STEPS.length - 1, step));
-  const from = state.step; state.step = step;
-  const t = STEPS[step], now = clock.elapsedTime;
-  // Closing all the way from the inside spread folds the flap in first, then the cover over it.
-  const closingBoth = from === 2 && step === 0;
-  anim.left.to = t.left; anim.left.delay = closingBoth ? .4 : 0;
-  anim.right.to = t.right; anim.right.delay = 0;
-  anim.spread.to = t.spread; anim.spread.delay = 0;
-  for (const a of [anim.left, anim.right, anim.spread]) a.start = now, a.from = a.v;
+// Move the paper in order: turn back first if needed, cover before flap when opening, flap before cover when closing.
+function fold(to, flip) {
+  const now = clock.elapsedTime, from = FOLD[state.fold], f = FOLD[to];
+  let t = 0;
+  if (state.flipped && !flip) { tween(anim.turn, 0, 0, now); t = 1.0; state.flipped = false; }
+  const openLeft = f.left < from.left - .01, closeLeft = f.left > from.left + .01;
+  const openRight = f.right > from.right + .01, closeRight = f.right < from.right - .01;
+  if (openLeft || openRight) {
+    if (openLeft) { tween(anim.left, f.left, t, now); t += .35; }
+    if (openRight) { tween(anim.right, f.right, t, now); t += .35; }
+  } else if (closeLeft || closeRight) {
+    if (closeRight) { tween(anim.right, f.right, t, now); t += .45; }
+    if (closeLeft) { tween(anim.left, f.left, t, now); t += .6; }
+  }
+  tween(anim.spread, f.spread, 0, now);
+  if (flip && !state.flipped) { tween(anim.turn, Math.PI, t, now); state.flipped = true; }
+  state.fold = to;
+}
+
+function go(i, instant = false) {
+  i = (i + STEPS.length) % STEPS.length;
+  state.step = i;
+  const s = STEPS[i];
+  fold(s.fold, s.flip);
+  lookAt(s.page, instant);
   ui();
 }
-function next() { go(state.step === STEPS.length - 1 ? 0 : state.step + 1); }
+const next = () => go(state.step + 1);
+const prev = () => { if (state.step > 0) go(state.step - 1); };
+
 function setFlipped(f) {
   state.flipped = f;
-  anim.turn.to = f ? Math.PI : 0; anim.turn.start = clock.elapsedTime; anim.turn.from = anim.turn.v; anim.turn.delay = 0;
+  tween(anim.turn, f ? Math.PI : 0, 0, clock.elapsedTime);
   ui();
 }
 function setLang(lang) {
   if (lang === state.lang) return;
-  state.lang = lang;
+  state.lang = lang; STEPS = steps(lang);
   document.querySelectorAll('.seg button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.lang === lang)));
-  applyTextures(); ui();
+  applyTextures();
+  lookAt(STEPS[state.step].page);
+  ui();
 }
 function ui() {
-  nextLabel.textContent = STEPS[state.step].next;
+  const s = STEPS[state.step];
+  nextLabel.textContent = s.next;
   prevBtn.disabled = state.step === 0;
-  dots.forEach((d, i) => d.classList.toggle('on', i === state.step));
-  const lang = state.lang === 'ar' ? 'Arabic' : 'English';
-  const say = `${STEPS[state.step].say}${state.flipped ? ', turned over' : ''}, ${lang}`;
+  dotEls.forEach((d, i) => d.classList.toggle('on', i === state.step));
+  const say = `${s.say}, ${state.lang === 'ar' ? 'Arabic' : 'English'}`;
   canvas.setAttribute('aria-label', `Arafa Homes brochure. ${say}.`);
   status.textContent = say;
 }
 
-// Camera: orbit with damping, no zoom or pan, kept above the floor.
+// Camera: orbit with damping, no zoom or pan. Each step glides to one page, square on.
 const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true; controls.dampingFactor = .06;
 controls.enablePan = false; controls.enableZoom = false;
-controls.minPolarAngle = THREE.MathUtils.degToRad(58); controls.maxPolarAngle = THREE.MathUtils.degToRad(88);
-controls.minAzimuthAngle = THREE.MathUtils.degToRad(-60); controls.maxAzimuthAngle = THREE.MathUtils.degToRad(60);
+controls.minPolarAngle = deg(58); controls.maxPolarAngle = deg(88);
+controls.minAzimuthAngle = deg(-70); controls.maxAzimuthAngle = deg(70);
 controls.rotateSpeed = .55;
 controls.target.set(0, H / 2, 0);
-const home = { az: THREE.MathUtils.degToRad(-16), polar: THREE.MathUtils.degToRad(80) };
-let fit = { closed: 2, open: 3 };
-const distFor = spread => fit.closed + (fit.open - fit.closed) * spread;
+const POLAR = deg(82);
+let pageDist = 2;
 
 function frame() {
   const w = stage.clientWidth, h = stage.clientHeight;
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
-  // Fit the open spread (about 3 panels wide) or the closed brochure, with room for the header and toolbar.
-  const vFov = THREE.MathUtils.degToRad(camera.fov), k = 1 / 2 / Math.tan(vFov / 2);
-  const fitH = H * 1.6 * k;
-  fit = { closed: Math.max(fitH, W * 2.1 * k / camera.aspect), open: Math.max(fitH, W * 3.7 * k / camera.aspect) };
   camera.updateProjectionMatrix();
+  // One page fills the frame, leaving room for the header and toolbar.
+  const k = 1 / 2 / Math.tan(deg(camera.fov) / 2);
+  pageDist = Math.max(H * 1.42 * k, W * 1.9 * k / camera.aspect);
 }
-function placeCamera(az, polar) {
-  camera.position.setFromSphericalCoords(distFor(anim.spread.v), polar, az).add(controls.target);
-  camera.lookAt(controls.target);
+let cam = null;
+function lookAt(name, instant = false) {
+  const p = PAGE[name];
+  const target = new THREE.Vector3(p.x, H / 2, p.z);
+  const sph = new THREE.Spherical().setFromVector3(camera.position.clone().sub(controls.target));
+  cam = { t0: clock.elapsedTime, dur: instant ? 0 : 1.25,
+    from: { target: controls.target.clone(), r: sph.radius, phi: sph.phi, theta: sph.theta },
+    to: { target, r: pageDist, phi: POLAR, theta: p.az } };
 }
-function resetView() {
-  const s = new THREE.Spherical().setFromVector3(camera.position.clone().sub(controls.target));
-  resetAnim = { t0: clock.elapsedTime, az0: s.theta, p0: s.phi };
-}
-let resetAnim = null;
+const resetView = () => lookAt(STEPS[state.step].page);
 
-// Tap on the paper opens or closes it; dragging orbits.
+// Tap on the paper turns the page; dragging looks around.
 const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
 let down = null;
 canvas.addEventListener('pointerdown', e => { down = { x: e.clientX, y: e.clientY }; stage.classList.add('dragging'); });
@@ -205,10 +255,10 @@ addEventListener('pointerup', e => {
   ray.setFromCamera(ndc, camera);
   if (ray.intersectObjects(panels, false).length) next();
 });
-controls.addEventListener('start', () => { resetAnim = null; });
+controls.addEventListener('start', () => { cam = null; });
 
 nextBtn.addEventListener('click', next);
-prevBtn.addEventListener('click', () => go(state.step - 1));
+prevBtn.addEventListener('click', prev);
 flipBtn.addEventListener('click', () => setFlipped(!state.flipped));
 resetBtn.addEventListener('click', resetView);
 document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => setLang(b.dataset.lang)));
@@ -216,7 +266,7 @@ addEventListener('keydown', e => {
   if (e.target.closest && e.target.closest('button')) return;
   const k = e.key.toLowerCase();
   if (k === 'enter' || k === ' ' || k === 'arrowright') { e.preventDefault(); next(); }
-  else if (k === 'arrowleft' || k === 'backspace') go(state.step - 1);
+  else if (k === 'arrowleft' || k === 'backspace') prev();
   else if (k === 't') setFlipped(!state.flipped);
   else if (k === 'l') setLang(state.lang === 'en' ? 'ar' : 'en');
 });
@@ -241,32 +291,30 @@ function tick() {
   brochure.rotation.y = anim.turn.v;
   holder.position.y = H / 2 + Math.sin(anim.turn.v) * .05;
   // Contact shadow widens as the brochure opens.
-  const s = 1 + anim.spread.v * 1.6;
-  contact.scale.set(W * 1.5 * s, .32, 1);
-  if (resetAnim) {
-    const t = Math.min(1, (clock.elapsedTime - resetAnim.t0) / .9), k = ease(t);
-    placeCamera(resetAnim.az0 + (home.az - resetAnim.az0) * k, resetAnim.p0 + (home.polar - resetAnim.p0) * k);
-    if (t >= 1) resetAnim = null;
+  contact.scale.set(W * 1.5 * (1 + anim.spread.v * 1.6), .32, 1);
+  if (cam) {
+    const t = reduceMotion || !cam.dur ? 1 : Math.min(1, (clock.elapsedTime - cam.t0) / cam.dur), k = ease(t);
+    const { from: a, to: b } = cam;
+    controls.target.lerpVectors(a.target, b.target, k);
+    camera.position.setFromSphericalCoords(a.r + (b.r - a.r) * k, a.phi + (b.phi - a.phi) * k, a.theta + (b.theta - a.theta) * k).add(controls.target);
+    if (t >= 1) cam = null;
   }
-  // Dolly in or out with the fold so the brochure always fills the frame.
-  const off = camera.position.clone().sub(controls.target);
-  off.setLength(distFor(anim.spread.v));
-  camera.position.copy(controls.target).add(off);
   controls.update();
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
 }
 
-// Deep links: ?lang=ar and ?open=1.
+// Deep links: ?lang=ar, and ?page=N to start on a page (1 is the cover).
 const qs = new URLSearchParams(location.search);
-addEventListener('resize', () => { frame(); controls.update(); });
+addEventListener('resize', () => { frame(); lookAt(STEPS[state.step].page, true); });
 
 Promise.all(loads).then(() => {
   frame();
-  placeCamera(home.az, home.polar);
+  camera.position.setFromSphericalCoords(pageDist, POLAR, PAGE.cover.az).add(controls.target);
   if (qs.get('lang') === 'ar') setLang('ar'); else applyTextures();
-  if (qs.get('open') === '1') go(2);
-  ui();
+  const start = Math.max(1, Math.min(STEPS.length, +qs.get('page') || 1)) - 1;
+  go(start, true);
+  if (start) { for (const a of Object.values(anim)) { a.v = a.to; a.start = null; } }
   loading.classList.add('gone');
   tick();
 });
